@@ -49,22 +49,23 @@ static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32
 static bool RemoteTransactionIdle(MultiConnection *connection);
 
 /* types for async connection management */
-typedef struct MultiConnectionReady
+typedef struct MultiConnectionState
 {
 	MultiConnection *connection;
 	bool ready;
 	PostgresPollingStatusType pollmode;
-} MultiConnectionReady;
+} MultiConnectionState;
 
 
 /* helper functions for async connection management */
-static void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
-static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(List *connections,
-																int *waitCount);
-static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
+static void MultiConnectionStatePoll(MultiConnectionState *mcr);
+static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
+															int *waitCount);
 static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
-static bool CheckConnectionsTimeout(List *connections);
-static void CloseNotReadyConnections(List *connections);
+static bool CheckMultiConnectionStateTimeouts(List *connections);
+static void CloseNotReadyMultiConnectionStates(List *connections);
+
+static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -457,48 +458,49 @@ ShutdownConnection(MultiConnection *connection)
 
 
 static void
-MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
+MultiConnectionStatePoll(MultiConnectionState *connectionState)
 {
-	MultiConnection *connection = mcr->connection;
+	Assert(!connectionState->ready);
+
+	MultiConnection *connection = connectionState->connection;
 	ConnStatusType status = PQstatus(connection->pgConn);
 
-	Assert(!mcr->ready);
 
 	if (status == CONNECTION_OK)
 	{
-		mcr->ready = true;
+		connectionState->ready = true;
 		return;
 	}
 	else if (status == CONNECTION_BAD)
 	{
 		/* FIXME: retries? */
-		mcr->ready = true;
+		connectionState->ready = true;
 		return;
 	}
 	else
 	{
-		mcr->ready = false;
+		connectionState->ready = false;
 	}
 
-	mcr->pollmode = PQconnectPoll(connection->pgConn);
+	connectionState->pollmode = PQconnectPoll(connection->pgConn);
 
 	/*
 	 * FIXME: Do we want to add transparent retry support here?
 	 */
-	if (mcr->pollmode == PGRES_POLLING_FAILED)
+	if (connectionState->pollmode == PGRES_POLLING_FAILED)
 	{
-		mcr->ready = true;
+		connectionState->ready = true;
 		return;
 	}
-	else if (mcr->pollmode == PGRES_POLLING_OK)
+	else if (connectionState->pollmode == PGRES_POLLING_OK)
 	{
-		mcr->ready = true;
+		connectionState->ready = true;
 		return;
 	}
 	else
 	{
-		Assert(mcr->pollmode == PGRES_POLLING_WRITING ||
-			   mcr->pollmode == PGRES_POLLING_READING);
+		Assert(connectionState->pollmode == PGRES_POLLING_WRITING ||
+			   connectionState->pollmode == PGRES_POLLING_READING);
 	}
 }
 
@@ -508,7 +510,7 @@ MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
  * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
  */
 static WaitEventSet *
-WaitEventSetFromMultiConnectionReadyArray(List *connections, int *waitCount)
+WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 {
 	WaitEventSet *waitEventSet = NULL;
 	ListCell *connectionCell = NULL;
@@ -549,7 +551,7 @@ WaitEventSetFromMultiConnectionReadyArray(List *connections, int *waitCount)
 
 	foreach(connectionCell, connections)
 	{
-		MultiConnectionReady *connection = (MultiConnectionReady *) lfirst(
+		MultiConnectionState *connectionState = (MultiConnectionState *) lfirst(
 			connectionCell);
 		int socket = 0;
 		int eventMask = 0;
@@ -560,16 +562,16 @@ WaitEventSetFromMultiConnectionReadyArray(List *connections, int *waitCount)
 			break;
 		}
 
-		if (connection->ready)
+		if (connectionState->ready)
 		{
 			/* connections that are ready will not be added to the WaitSet */
 			continue;
 		}
 
-		socket = PQsocket(connection->connection->pgConn);
+		socket = PQsocket(connectionState->connection->pgConn);
 
 		eventMask = 0;
-		if (connection->pollmode == PGRES_POLLING_READING)
+		if (connectionState->pollmode == PGRES_POLLING_READING)
 		{
 			eventMask |= WL_SOCKET_READABLE;
 		}
@@ -578,7 +580,8 @@ WaitEventSetFromMultiConnectionReadyArray(List *connections, int *waitCount)
 			eventMask |= WL_SOCKET_WRITEABLE;
 		}
 
-		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, (void *) connection);
+		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL,
+						  (void *) connectionState);
 
 		/* increment the waitCount if non NULL */
 		if (waitCount)
@@ -614,7 +617,7 @@ void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
 	TimestampTz deadline = 0;
-	List *connections = NULL;
+	List *connectionStates = NULL;
 	ListCell *multiConnectionCell = NULL;
 
 	WaitEventSet *waitEventSet = NULL;
@@ -626,7 +629,8 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	foreach(multiConnectionCell, multiConnectionList)
 	{
 		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
-		MultiConnectionReady *mcr = palloc0(sizeof(MultiConnectionReady));
+		MultiConnectionState *connectionState = palloc0(sizeof(MultiConnectionState));
+
 		TimestampTz connectionDeadline = TimestampTzPlusMilliseconds(
 			connection->connectionStart, NodeConnectionTimeout);
 		if (connectionDeadline > deadline)
@@ -634,34 +638,37 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			deadline = connectionDeadline;
 		}
 
-		mcr->connection = connection;
+		connectionState->connection = connection;
 
 		/*
 		 * before we can build the waitset to wait for asynchronous IO we need to know the
 		 * pollmode to use for the sockets. This is populated by executing one round of
-		 * PQconnectPoll. This updates the MultiConnectionReady struct with the ready state
+		 * PQconnectPoll. This updates the MultiConnectionState struct with the ready state
 		 * and its next poll mode.
 		 */
-		MultiConnectionReadyExecutePoll(mcr);
+		MultiConnectionStatePoll(connectionState);
 
-		connections = lappend(connections, mcr);
-		if (!mcr->ready)
+		connectionStates = lappend(connectionStates, connectionState);
+		if (!connectionState->ready)
 		{
 			waitCount++;
 		}
 	}
 
 	/* prepapre space for socket events */
-	events = (WaitEvent *) palloc0(list_length(connections) * sizeof(WaitEvent));
+	#define MIN(a, b) ((a) > (b) ? (b) : (a))
+	events = (WaitEvent *) palloc0(MIN(list_length(connectionStates), FD_SETSIZE) *
+								   sizeof(WaitEvent));
 
 	/*
 	 * for high connection counts with lots of round trips we could potentially have a lot
 	 * of (big) waitsets that we'd like to clean right after we have used them. To do this
 	 * we switch to a temporary memory context for this loop which gets reset at the end
 	 */
-	oldContext = MemoryContextSwitchTo(AllocSetContextCreate(CurrentMemoryContext,
-															 "connection establishment temporary context",
-															 ALLOCSET_DEFAULT_SIZES));
+	oldContext = MemoryContextSwitchTo(
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "connection establishment temporary context",
+							  ALLOCSET_DEFAULT_SIZES));
 	while (waitCount > 0)
 	{
 		long timeout = DeadlineTimestampTzToTimeout(deadline);
@@ -671,8 +678,8 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		if (waitEventSetRebuild)
 		{
 			MemoryContextReset(CurrentMemoryContext);
-			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections,
-																	 &waitCount);
+			waitEventSet = WaitEventSetFromMultiConnectionStates(connectionStates,
+																 &waitCount);
 
 			if (waitCount <= 0)
 			{
@@ -686,7 +693,8 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		for (eventIndex = 0; eventIndex < eventCount; eventIndex++)
 		{
 			WaitEvent *event = &events[eventIndex];
-			MultiConnectionReady *connection = (MultiConnectionReady *) event->user_data;
+			MultiConnectionState *connectionState =
+				(MultiConnectionState *) event->user_data;
 
 			if (event->events & WL_POSTMASTER_DEATH)
 			{
@@ -712,7 +720,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				continue;
 			}
 
-			MultiConnectionReadyExecutePoll(connection);
+			MultiConnectionStatePoll(connectionState);
 
 			/* TODO: actually test if the change from above should cause a rebuild */
 			waitEventSetRebuild = true;
@@ -725,12 +733,12 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			 * is the case and close all non-connected sockets
 			 */
 
-			bool timeoutOccured = CheckConnectionsTimeout(connections);
+			bool timeoutOccured = CheckMultiConnectionStateTimeouts(connectionStates);
 			if (timeoutOccured)
 			{
 				ereport(WARNING, (errmsg("could not establish connection after %u ms",
 										 NodeConnectionTimeout)));
-				CloseNotReadyConnections(connections);
+				CloseNotReadyMultiConnectionStates(connectionStates);
 
 				/* we are done waiting for the sockets */
 				break;
@@ -752,14 +760,14 @@ DeadlineTimestampTzToTimeout(TimestampTz deadline)
 
 
 static void
-CloseNotReadyConnections(List *connections)
+CloseNotReadyMultiConnectionStates(List *connections)
 {
 	ListCell *connectionCell = NULL;
 	foreach(connectionCell, connections)
 	{
-		MultiConnectionReady *mcr = lfirst(connectionCell);
-		MultiConnection *connection = mcr->connection;
-		if (mcr->ready)
+		MultiConnectionState *connectionState = lfirst(connectionCell);
+		MultiConnection *connection = connectionState->connection;
+		if (connectionState->ready)
 		{
 			continue;
 		}
@@ -772,17 +780,17 @@ CloseNotReadyConnections(List *connections)
 
 
 static bool
-CheckConnectionsTimeout(List *connections)
+CheckMultiConnectionStateTimeouts(List *connections)
 {
 	ListCell *connectionCell = NULL;
 	TimestampTz now = GetCurrentTimestamp();
 
 	foreach(connectionCell, connections)
 	{
-		MultiConnectionReady *mcr = lfirst(connectionCell);
-		MultiConnection *connection = mcr->connection;
+		MultiConnectionState *connectionState = lfirst(connectionCell);
+		MultiConnection *connection = connectionState->connection;
 
-		if (mcr->ready)
+		if (connectionState->ready)
 		{
 			/* skip the deadline test for connections that are already established */
 			continue;
