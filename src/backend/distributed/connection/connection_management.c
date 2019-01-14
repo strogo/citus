@@ -11,11 +11,6 @@
 #include "postgres.h"
 #include "pgstat.h"
 
-#ifdef HAVE_POLL_H
-#include <poll.h>
-#endif
-
-
 #include "libpq-fe.h"
 
 #include "miscadmin.h"
