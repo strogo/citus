@@ -460,11 +460,10 @@ ShutdownConnection(MultiConnection *connection)
 static void
 MultiConnectionStatePoll(MultiConnectionState *connectionState)
 {
-	Assert(!connectionState->ready);
-
 	MultiConnection *connection = connectionState->connection;
 	ConnStatusType status = PQstatus(connection->pgConn);
 
+	Assert(!connectionState->ready);
 
 	if (status == CONNECTION_OK)
 	{
