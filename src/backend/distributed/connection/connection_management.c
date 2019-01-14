@@ -59,14 +59,12 @@ typedef struct MultiConnectionReady
 
 /* helper functions for async connection management */
 static void MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr);
-static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(
-	MultiConnectionReady *connections, int numConnections, int *waitCount);
+static WaitEventSet * WaitEventSetFromMultiConnectionReadyArray(List *connections,
+																int *waitCount);
 static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
 static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
-static bool CheckConnectionsTimeout(MultiConnectionReady *connections, int
-									connectionCount);
-static void CloseNotReadyConnections(MultiConnectionReady *connections, int
-									 connectionCount);
+static bool CheckConnectionsTimeout(List *connections);
+static void CloseNotReadyConnections(List *connections);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -510,11 +508,10 @@ MultiConnectionReadyExecutePoll(MultiConnectionReady *mcr)
  * waitCount populates the number of connections waiting for in case of a non NULL pointer is provided
  */
 static WaitEventSet *
-WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
-										  int numConnections, int *waitCount)
+WaitEventSetFromMultiConnectionReadyArray(List *connections, int *waitCount)
 {
 	WaitEventSet *waitEventSet = NULL;
-	int connectionIndex = 0;
+	ListCell *connectionCell = NULL;
 
 	/*
 	 * maxEvents is the value min(numConnections, FD_SETSIZE - 3), this is to not add more
@@ -526,7 +523,7 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 	 *
 	 *  During the loop events are added as long as maxEvents does not reach 0
 	 */
-	int maxEvents = numConnections;
+	int maxEvents = list_length(connections);
 	if (maxEvents > (FD_SETSIZE - 3))
 	{
 		maxEvents = FD_SETSIZE - 3;
@@ -550,22 +547,29 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 	AddWaitEventToSet(waitEventSet, WL_POSTMASTER_DEATH, PGINVALID_SOCKET, NULL, NULL);
 	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 
-	for (connectionIndex = 0; connectionIndex < numConnections && maxEvents > 0;
-		 connectionIndex++)
+	foreach(connectionCell, connections)
 	{
+		MultiConnectionReady *connection = (MultiConnectionReady *) lfirst(
+			connectionCell);
 		int socket = 0;
 		int eventMask = 0;
 
-		if (connections[connectionIndex].ready)
+		if (maxEvents == 0)
+		{
+			/* room for events to schedule is exhausted */
+			break;
+		}
+
+		if (connection->ready)
 		{
 			/* connections that are ready will not be added to the WaitSet */
 			continue;
 		}
 
-		socket = PQsocket(connections[connectionIndex].connection->pgConn);
+		socket = PQsocket(connection->connection->pgConn);
 
 		eventMask = 0;
-		if (connections[connectionIndex].pollmode == PGRES_POLLING_READING)
+		if (connection->pollmode == PGRES_POLLING_READING)
 		{
 			eventMask |= WL_SOCKET_READABLE;
 		}
@@ -574,17 +578,16 @@ WaitEventSetFromMultiConnectionReadyArray(MultiConnectionReady *connections,
 			eventMask |= WL_SOCKET_WRITEABLE;
 		}
 
-		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL,
-						  (void *) &connections[connectionIndex]);
-
-		/* keep the maxEvents up to date with how many we can still add */
-		maxEvents--;
+		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, (void *) connection);
 
 		/* increment the waitCount if non NULL */
 		if (waitCount)
 		{
 			*waitCount = *waitCount + 1;
 		}
+
+		/* keep the maxEvents up to date with how many we can still add */
+		maxEvents--;
 	}
 
 	return waitEventSet;
@@ -610,10 +613,8 @@ EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg)
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
-	int connectionIndex = 0;
-	int connectionCount = 0;
 	TimestampTz deadline = 0;
-	MultiConnectionReady *connections = NULL;
+	List *connections = NULL;
 	ListCell *multiConnectionCell = NULL;
 
 	WaitEventSet *waitEventSet = NULL;
@@ -622,16 +623,10 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	WaitEvent *events = NULL;
 	MemoryContext oldContext = NULL;
 
-	/*
-	 * Here we prepare an array that keeps the MultiConnection together with the
-	 * information on if and how to wait before PQconnectionPoll should be called on it
-	 */
-	connectionCount = list_length(multiConnectionList);
-	connections = (MultiConnectionReady *) palloc0(connectionCount *
-												   sizeof(MultiConnectionReady));
 	foreach(multiConnectionCell, multiConnectionList)
 	{
 		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
+		MultiConnectionReady *mcr = palloc0(sizeof(MultiConnectionReady));
 		TimestampTz connectionDeadline = TimestampTzPlusMilliseconds(
 			connection->connectionStart, NodeConnectionTimeout);
 		if (connectionDeadline > deadline)
@@ -639,7 +634,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			deadline = connectionDeadline;
 		}
 
-		connections[connectionIndex].connection = connection;
+		mcr->connection = connection;
 
 		/*
 		 * before we can build the waitset to wait for asynchronous IO we need to know the
@@ -647,18 +642,17 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		 * PQconnectPoll. This updates the MultiConnectionReady struct with the ready state
 		 * and its next poll mode.
 		 */
-		MultiConnectionReadyExecutePoll(&connections[connectionIndex]);
+		MultiConnectionReadyExecutePoll(mcr);
 
-		if (!connections[connectionIndex].ready)
+		connections = lappend(connections, mcr);
+		if (!mcr->ready)
 		{
 			waitCount++;
 		}
-
-		connectionIndex++;
 	}
 
 	/* prepapre space for socket events */
-	events = (WaitEvent *) palloc0(connectionCount * sizeof(WaitEvent));
+	events = (WaitEvent *) palloc0(list_length(connections) * sizeof(WaitEvent));
 
 	/*
 	 * for high connection counts with lots of round trips we could potentially have a lot
@@ -678,7 +672,6 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 		{
 			MemoryContextReset(CurrentMemoryContext);
 			waitEventSet = WaitEventSetFromMultiConnectionReadyArray(connections,
-																	 connectionCount,
 																	 &waitCount);
 
 			if (waitCount <= 0)
@@ -732,12 +725,12 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			 * is the case and close all non-connected sockets
 			 */
 
-			bool timeoutOccured = CheckConnectionsTimeout(connections, connectionCount);
+			bool timeoutOccured = CheckConnectionsTimeout(connections);
 			if (timeoutOccured)
 			{
 				ereport(WARNING, (errmsg("could not establish connection after %u ms",
 										 NodeConnectionTimeout)));
-				CloseNotReadyConnections(connections, connectionCount);
+				CloseNotReadyConnections(connections);
 
 				/* we are done waiting for the sockets */
 				break;
@@ -759,13 +752,14 @@ DeadlineTimestampTzToTimeout(TimestampTz deadline)
 
 
 static void
-CloseNotReadyConnections(MultiConnectionReady *connections, int connectionCount)
+CloseNotReadyConnections(List *connections)
 {
-	int connectionIndex = 0;
-	for (connectionIndex = 0; connectionIndex < connectionCount; connectionIndex++)
+	ListCell *connectionCell = NULL;
+	foreach(connectionCell, connections)
 	{
-		MultiConnection *connection = connections[connectionIndex].connection;
-		if (connections[connectionIndex].ready)
+		MultiConnectionReady *mcr = lfirst(connectionCell);
+		MultiConnection *connection = mcr->connection;
+		if (mcr->ready)
 		{
 			continue;
 		}
@@ -778,15 +772,17 @@ CloseNotReadyConnections(MultiConnectionReady *connections, int connectionCount)
 
 
 static bool
-CheckConnectionsTimeout(MultiConnectionReady *connections, int connectionCount)
+CheckConnectionsTimeout(List *connections)
 {
-	int connectionIndex = 0;
+	ListCell *connectionCell = NULL;
 	TimestampTz now = GetCurrentTimestamp();
 
-	for (connectionIndex = 0; connectionIndex < connectionCount; connectionIndex++)
+	foreach(connectionCell, connections)
 	{
-		MultiConnection *connection = connections[connectionIndex].connection;
-		if (connections[connectionIndex].ready)
+		MultiConnectionReady *mcr = lfirst(connectionCell);
+		MultiConnection *connection = mcr->connection;
+
+		if (mcr->ready)
 		{
 			/* skip the deadline test for connections that are already established */
 			continue;
