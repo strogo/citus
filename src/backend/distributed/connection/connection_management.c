@@ -24,6 +24,7 @@
 #include "commands/dbcommands.h"
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/memutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/placement_connection.h"
@@ -64,8 +65,6 @@ static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
 static bool CheckMultiConnectionStateTimeouts(List *connections);
 static void CloseNotReadyMultiConnectionStates(List *connections);
-
-static void EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -593,17 +592,6 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	}
 
 	return waitEventSet;
-}
-
-
-static void
-EnsureReleaseResource(MemoryContextCallbackFunction callback, void *arg)
-{
-	MemoryContextCallback *cb = MemoryContextAllocZero(CurrentMemoryContext,
-													   sizeof(MemoryContextCallback));
-	cb->func = callback;
-	cb->arg = arg;
-	MemoryContextRegisterResetCallback(CurrentMemoryContext, cb);
 }
 
 
