@@ -59,12 +59,18 @@ typedef struct MultiConnectionState
 
 
 /* helper functions for async connection management */
-static void MultiConnectionStatePoll(MultiConnectionState *mcr);
+enum EventSetResult
+{
+	Rebuild, Update, None
+};
+static enum EventSetResult MultiConnectionStatePoll(
+	MultiConnectionState *connectionState);
 static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 															int *waitCount);
 static int DeadlineTimestampTzToTimeout(TimestampTz deadline);
 static bool CheckMultiConnectionStateTimeouts(List *connections);
 static void CloseNotReadyMultiConnectionStates(List *connections);
+static uint32 MultiConnectionStateEventMask(MultiConnectionState *connectionState);
 
 
 static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
@@ -456,24 +462,25 @@ ShutdownConnection(MultiConnection *connection)
 }
 
 
-static void
+static enum EventSetResult
 MultiConnectionStatePoll(MultiConnectionState *connectionState)
 {
 	MultiConnection *connection = connectionState->connection;
 	ConnStatusType status = PQstatus(connection->pgConn);
+	PostgresPollingStatusType oldPollmode = connectionState->pollmode;
 
 	Assert(!connectionState->ready);
 
 	if (status == CONNECTION_OK)
 	{
 		connectionState->ready = true;
-		return;
+		return Rebuild;
 	}
 	else if (status == CONNECTION_BAD)
 	{
 		/* FIXME: retries? */
 		connectionState->ready = true;
-		return;
+		return Rebuild;
 	}
 	else
 	{
@@ -488,18 +495,20 @@ MultiConnectionStatePoll(MultiConnectionState *connectionState)
 	if (connectionState->pollmode == PGRES_POLLING_FAILED)
 	{
 		connectionState->ready = true;
-		return;
+		return Rebuild;
 	}
 	else if (connectionState->pollmode == PGRES_POLLING_OK)
 	{
 		connectionState->ready = true;
-		return;
+		return Rebuild;
 	}
 	else
 	{
 		Assert(connectionState->pollmode == PGRES_POLLING_WRITING ||
 			   connectionState->pollmode == PGRES_POLLING_READING);
 	}
+
+	return (oldPollmode != connectionState->pollmode) ? Update : None;
 }
 
 
@@ -568,18 +577,9 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 
 		socket = PQsocket(connectionState->connection->pgConn);
 
-		eventMask = 0;
-		if (connectionState->pollmode == PGRES_POLLING_READING)
-		{
-			eventMask |= WL_SOCKET_READABLE;
-		}
-		else
-		{
-			eventMask |= WL_SOCKET_WRITEABLE;
-		}
+		eventMask = MultiConnectionStateEventMask(connectionState);
 
-		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL,
-						  (void *) connectionState);
+		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, connectionState);
 
 		/* increment the waitCount if non NULL */
 		if (waitCount)
@@ -592,6 +592,27 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	}
 
 	return waitEventSet;
+}
+
+
+/*
+ * MultiConnectionStateEventMask returns the eventMask use by the WaitEventSet for the
+ * for the socket associated with the connection based on the pollmode PQconnectPoll
+ * returned in its last invocation
+ */
+static uint32
+MultiConnectionStateEventMask(MultiConnectionState *connectionState)
+{
+	uint32 eventMask = 0;
+	if (connectionState->pollmode == PGRES_POLLING_READING)
+	{
+		eventMask |= WL_SOCKET_READABLE;
+	}
+	else
+	{
+		eventMask |= WL_SOCKET_WRITEABLE;
+	}
+	return eventMask;
 }
 
 
@@ -667,6 +688,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			MemoryContextReset(CurrentMemoryContext);
 			waitEventSet = WaitEventSetFromMultiConnectionStates(connectionStates,
 																 &waitCount);
+			waitEventSetRebuild = false;
 
 			if (waitCount <= 0)
 			{
@@ -707,10 +729,26 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				continue;
 			}
 
-			MultiConnectionStatePoll(connectionState);
+			switch (MultiConnectionStatePoll(connectionState))
+			{
+				case Rebuild:
+				{
+					waitEventSetRebuild = true;
+					break;
+				}
 
-			/* TODO: actually test if the change from above should cause a rebuild */
-			waitEventSetRebuild = true;
+				case Update:
+				{
+					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
+					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
+					break;
+				}
+
+				case None:
+				{
+					break;
+				}
+			}
 		}
 
 		if (eventCount == 0)
