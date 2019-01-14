@@ -532,11 +532,7 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	 *
 	 *  During the loop events are added as long as maxEvents does not reach 0
 	 */
-	int maxEvents = list_length(connections);
-	if (maxEvents > (FD_SETSIZE - 3))
-	{
-		maxEvents = FD_SETSIZE - 3;
-	}
+	int maxEvents = Min(list_length(connections), FD_SETSIZE - 3);
 
 	if (waitCount)
 	{
@@ -664,8 +660,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	}
 
 	/* prepapre space for socket events */
-	#define MIN(a, b) ((a) > (b) ? (b) : (a))
-	events = (WaitEvent *) palloc0(MIN(list_length(connectionStates), FD_SETSIZE) *
+	events = (WaitEvent *) palloc0(Min(list_length(connectionStates), FD_SETSIZE) *
 								   sizeof(WaitEvent));
 
 	/*
