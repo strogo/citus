@@ -36,6 +36,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/var.h"
 #include "parser/parsetree.h"
+#include "parser/parse_coerce.h"
 
 
 /*
@@ -1546,6 +1547,9 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
  * Only exception is that, if a join is given an alias name, we do not want to
  * flatten those var's. If we do, deparsing fails since it expects to see a join
  * alias, and cannot access the RTE in the join tree by their names.
+ *
+ * Also note that in case of full outer joins, a column could be flattened to a
+ * coalesce expression if the column appears in the USING clause.
  */
 static void
 FlattenJoinVars(List *columnList, Query *queryTree)
@@ -1573,7 +1577,7 @@ FlattenJoinVars(List *columnList, Query *queryTree)
 		columnRte = rt_fetch(column->varno, rteList);
 		if (columnRte->rtekind == RTE_JOIN && columnRte->alias == NULL)
 		{
-			Var *normalizedVar = NULL;
+			Node *normalizedNode = NULL;
 
 			if (root == NULL)
 			{
@@ -1583,13 +1587,27 @@ FlattenJoinVars(List *columnList, Query *queryTree)
 				root->hasJoinRTEs = true;
 			}
 
-			normalizedVar = (Var *) flatten_join_alias_vars(root, (Node *) column);
+
+			normalizedNode = flatten_join_alias_vars(root, (Node *) column);
 
 			/*
 			 * We need to copy values over existing one to make sure it is updated on
 			 * respective places.
 			 */
-			memcpy(column, normalizedVar, sizeof(Var));
+
+			if (IsA(normalizedNode, Var))
+			{
+				memcpy(column, normalizedNode, sizeof(Var));
+			}
+			else if (IsA(normalizedNode, CoalesceExpr))
+			{
+				column = repalloc(column, sizeof(CoalesceExpr));
+				memcpy(column, normalizedNode, sizeof(CoalesceExpr));
+			}
+			else
+			{
+				elog(ERROR, "unrecognized node type: %d", nodeTag(normalizedNode));
+			}
 		}
 	}
 }
@@ -1609,13 +1627,13 @@ CreateSubqueryTargetEntryList(List *columnList)
 
 	foreach(columnCell, columnList)
 	{
-		Var *column = (Var *) lfirst(columnCell);
+		Node *column = (Node *) lfirst(columnCell);
 		uniqueColumnList = list_append_unique(uniqueColumnList, copyObject(column));
 	}
 
 	foreach(columnCell, uniqueColumnList)
 	{
-		Var *column = (Var *) lfirst(columnCell);
+		Node *column = (Node *) lfirst(columnCell);
 		TargetEntry *newTargetEntry = makeNode(TargetEntry);
 		StringInfo columnNameString = makeStringInfo();
 
@@ -1637,6 +1655,9 @@ CreateSubqueryTargetEntryList(List *columnList)
  * UpdateVarMappingsForExtendedOpNode updates varno/varattno fields of columns
  * in columnList to point to corresponding target in subquery target entry
  * list.
+ *
+ * If there exist a CoalesceExpression in the target list, it is also converted
+ * to Var in the ExtendedOpNode's column list.
  */
 static void
 UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryList)
@@ -1644,22 +1665,62 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryLi
 	ListCell *columnCell = NULL;
 	foreach(columnCell, columnList)
 	{
-		Var *columnOnTheExtendedNode = (Var *) lfirst(columnCell);
-		ListCell *targetEntryCell = NULL;
-		foreach(targetEntryCell, subqueryTargetEntryList)
-		{
-			TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-			Var *targetColumn = NULL;
+		Node *columnOnTheExtendedNode = (Node *) lfirst(columnCell);
 
-			Assert(IsA(targetEntry->expr, Var));
-			targetColumn = (Var *) targetEntry->expr;
-			if (columnOnTheExtendedNode->varno == targetColumn->varno &&
-				columnOnTheExtendedNode->varattno == targetColumn->varattno)
+		if (IsA(columnOnTheExtendedNode, Var))
+		{
+			Var *columnVar = (Var *)columnOnTheExtendedNode;
+			ListCell *targetEntryCell = NULL;
+
+			foreach(targetEntryCell, subqueryTargetEntryList)
 			{
-				columnOnTheExtendedNode->varno = 1;
-				columnOnTheExtendedNode->varattno = targetEntry->resno;
-				break;
+				TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+
+				if (IsA(targetEntry->expr, Var) && equal(targetEntry->expr, columnVar))
+				{
+					columnVar->varno = 1;
+					columnVar->varattno = targetEntry->resno;
+					break;
+				}
 			}
+		}
+
+		else if (IsA(columnOnTheExtendedNode, CoalesceExpr))
+		{
+			Oid expressionType = exprType(columnOnTheExtendedNode);
+			int32 expressionTypmod = exprTypmod(columnOnTheExtendedNode);
+			Oid	expressionCollation = exprCollation(columnOnTheExtendedNode);
+			CoalesceExpr *columnCoalesceExpr = (CoalesceExpr *)columnOnTheExtendedNode;
+			ListCell *targetEntryCell = NULL;
+
+			foreach(targetEntryCell, subqueryTargetEntryList)
+			{
+				TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
+
+				if (IsA(targetEntry->expr, CoalesceExpr) &&
+					equal(targetEntry->expr, columnCoalesceExpr))
+				{
+					/*
+					 * If coalesce exists on the target list, it should be converted
+					 * to Var on the column list of the target entry.
+					 */
+					Var *varOnTheExtendedNode = makeNode(Var);
+					varOnTheExtendedNode->varno = 1;
+					varOnTheExtendedNode->varattno = targetEntry->resno;
+					varOnTheExtendedNode->vartype = expressionType;
+					varOnTheExtendedNode->vartypmod = expressionTypmod;
+					varOnTheExtendedNode->varcollid = expressionCollation;
+					columnOnTheExtendedNode = repalloc(columnOnTheExtendedNode, sizeof(Var));
+					memcpy(columnOnTheExtendedNode, varOnTheExtendedNode, sizeof(Var));
+					break;
+				}
+			}
+
+		}
+
+		else
+		{
+			elog(ERROR, "unrecognized node type: %d", nodeTag(columnOnTheExtendedNode));
 		}
 	}
 }
