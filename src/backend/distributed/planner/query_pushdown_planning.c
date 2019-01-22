@@ -36,7 +36,6 @@
 #include "optimizer/clauses.h"
 #include "optimizer/var.h"
 #include "parser/parsetree.h"
-#include "parser/parse_coerce.h"
 
 
 /*
