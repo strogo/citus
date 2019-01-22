@@ -1669,7 +1669,7 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryLi
 
 		if (IsA(columnOnTheExtendedNode, Var))
 		{
-			Var *columnVar = (Var *)columnOnTheExtendedNode;
+			Var *columnVar = (Var *) columnOnTheExtendedNode;
 			ListCell *targetEntryCell = NULL;
 
 			foreach(targetEntryCell, subqueryTargetEntryList)
@@ -1684,13 +1684,12 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryLi
 				}
 			}
 		}
-
 		else if (IsA(columnOnTheExtendedNode, CoalesceExpr))
 		{
 			Oid expressionType = exprType(columnOnTheExtendedNode);
 			int32 expressionTypmod = exprTypmod(columnOnTheExtendedNode);
-			Oid	expressionCollation = exprCollation(columnOnTheExtendedNode);
-			CoalesceExpr *columnCoalesceExpr = (CoalesceExpr *)columnOnTheExtendedNode;
+			Oid expressionCollation = exprCollation(columnOnTheExtendedNode);
+			CoalesceExpr *columnCoalesceExpr = (CoalesceExpr *) columnOnTheExtendedNode;
 			ListCell *targetEntryCell = NULL;
 
 			foreach(targetEntryCell, subqueryTargetEntryList)
@@ -1710,14 +1709,13 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryLi
 					varOnTheExtendedNode->vartype = expressionType;
 					varOnTheExtendedNode->vartypmod = expressionTypmod;
 					varOnTheExtendedNode->varcollid = expressionCollation;
-					columnOnTheExtendedNode = repalloc(columnOnTheExtendedNode, sizeof(Var));
+					columnOnTheExtendedNode = repalloc(columnOnTheExtendedNode,
+													   sizeof(Var));
 					memcpy(columnOnTheExtendedNode, varOnTheExtendedNode, sizeof(Var));
 					break;
 				}
 			}
-
 		}
-
 		else
 		{
 			elog(ERROR, "unrecognized node type: %d", nodeTag(columnOnTheExtendedNode));
