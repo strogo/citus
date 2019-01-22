@@ -1605,7 +1605,8 @@ FlattenJoinVars(List *columnList, Query *queryTree)
 			}
 			else
 			{
-				elog(ERROR, "unrecognized node type: %d", nodeTag(normalizedNode));
+				elog(ERROR, "unrecognized node type: %d for subquery pushdown logic",
+					 nodeTag(normalizedNode));
 			}
 		}
 	}
@@ -1715,9 +1716,15 @@ UpdateVarMappingsForExtendedOpNode(List *columnList, List *subqueryTargetEntryLi
 				}
 			}
 		}
+		/*
+		 * Although following else should not be hit by any query given we made the
+		 * same check in the FlattenJoinVars function, it is added for the sake of
+		 * completeness.
+		 */
 		else
 		{
-			elog(ERROR, "unrecognized node type: %d", nodeTag(columnOnTheExtendedNode));
+			elog(ERROR, "unrecognized node type: %d for subquery pushdown logic",
+				 nodeTag(columnOnTheExtendedNode));
 		}
 	}
 }
