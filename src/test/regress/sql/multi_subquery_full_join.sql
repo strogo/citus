@@ -2,6 +2,8 @@
 -- Full join with subquery pushdown support 
 --
 
+SET citus.next_shard_id TO 9000000;
+
 CREATE TABLE test_table_1(id int, val1 int);
 CREATE TABLE test_table_2(id bigint, val1 int);
 CREATE TABLE test_table_3(id int, val1 bigint);
