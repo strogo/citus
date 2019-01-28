@@ -135,5 +135,36 @@ SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_proxy_port;
  t
 (1 row)
 
+-- Check failures on DDL command propagation
+CREATE TABLE t2 (id int PRIMARY KEY);
+SELECT citus.mitmproxy('conn.onParse(query="^INSERT INTO pg_dist_placement").kill()');
+ mitmproxy 
+-----------
+ 
+(1 row)
+
+SELECT create_distributed_table('t2', 'id');
+ERROR:  server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+CONTEXT:  while executing command on localhost:9060
+SELECT citus.mitmproxy('conn.onParse(query="^INSERT INTO pg_dist_shard").cancel(' || :pid || ')');
+ mitmproxy 
+-----------
+ 
+(1 row)
+
+SELECT create_distributed_table('t2', 'id');
+ERROR:  canceling statement due to user request
+-- Verify that the table was not distributed
+SELECT count(*) > 0 AS is_table_distributed
+FROM pg_dist_partition
+WHERE logicalrelid='t2'::regclass;
+ is_table_distributed 
+----------------------
+ f
+(1 row)
+
+DROP TABLE t1;
+DROP TABLE t2;
 DROP SCHEMA mx_metadata_sync CASCADE;
-NOTICE:  drop cascades to table t1

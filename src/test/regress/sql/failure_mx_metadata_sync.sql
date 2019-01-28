@@ -50,5 +50,20 @@ SELECT citus.mitmproxy('conn.allow()');
 SELECT start_metadata_sync_to_node('localhost', :worker_2_proxy_port);
 SELECT hasmetadata FROM pg_dist_node WHERE nodeport=:worker_2_proxy_port;
 
+-- Check failures on DDL command propagation
+CREATE TABLE t2 (id int PRIMARY KEY);
 
+SELECT citus.mitmproxy('conn.onParse(query="^INSERT INTO pg_dist_placement").kill()');
+SELECT create_distributed_table('t2', 'id');
+
+SELECT citus.mitmproxy('conn.onParse(query="^INSERT INTO pg_dist_shard").cancel(' || :pid || ')');
+SELECT create_distributed_table('t2', 'id');
+
+-- Verify that the table was not distributed
+SELECT count(*) > 0 AS is_table_distributed
+FROM pg_dist_partition
+WHERE logicalrelid='t2'::regclass;
+
+DROP TABLE t1;
+DROP TABLE t2;
 DROP SCHEMA mx_metadata_sync CASCADE;
