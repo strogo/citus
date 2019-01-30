@@ -65,7 +65,7 @@ static bool IsNodeQuery(Node *node);
 static bool IsOuterJoinExpr(Node *node);
 static bool WindowPartitionOnDistributionColumn(Query *query);
 static DeferredErrorMessage * DeferErrorIfFromClauseRecurs(Query *queryTree);
-static RecurringTuplesType DetermineQueryReturnsRecurringTuples(Query *queryTree);
+static RecurringTuplesType FromClauseRecurringTupleType(Query *queryTree);
 static DeferredErrorMessage * DeferredErrorIfUnsupportedRecurringTuplesJoin(
 	PlannerRestrictionContext *plannerRestrictionContext);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
@@ -573,7 +573,7 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 		return NULL;
 	}
 
-	recurType = DetermineQueryReturnsRecurringTuples(queryTree);
+	recurType = FromClauseRecurringTupleType(queryTree);
 	if (recurType == RECURRING_TUPLES_REFERENCE_TABLE)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -623,14 +623,14 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 
 
 /*
- * DetermineQueryReturnsRecurringTuples returns tuple recurrence information
- * in query result based on range table entries in from part.
+ * FromClauseRecurringTupleType returns tuple recurrence information
+ * in query result based on range table entries in from clause.
  *
  * Returned information is used to prepare appropriate deferred error
  * message for subquery pushdown checks.
  */
 static RecurringTuplesType
-DetermineQueryReturnsRecurringTuples(Query *queryTree)
+FromClauseRecurringTupleType(Query *queryTree)
 {
 	RecurringTuplesType recurType = RECURRING_TUPLES_INVALID;
 
@@ -1087,7 +1087,7 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree)
 			Query *leftArgSubquery = NULL;
 			leftArgRTI = ((RangeTblRef *) leftArg)->rtindex;
 			leftArgSubquery = rt_fetch(leftArgRTI, subqueryTree->rtable)->subquery;
-			recurType = DetermineQueryReturnsRecurringTuples(leftArgSubquery);
+			recurType = FromClauseRecurringTupleType(leftArgSubquery);
 			if (recurType != RECURRING_TUPLES_INVALID)
 			{
 				break;
@@ -1099,7 +1099,7 @@ DeferErrorIfUnsupportedUnionQuery(Query *subqueryTree)
 			Query *rightArgSubquery = NULL;
 			rightArgRTI = ((RangeTblRef *) rightArg)->rtindex;
 			rightArgSubquery = rt_fetch(rightArgRTI, subqueryTree->rtable)->subquery;
-			recurType = DetermineQueryReturnsRecurringTuples(rightArgSubquery);
+			recurType = FromClauseRecurringTupleType(rightArgSubquery);
 			if (recurType != RECURRING_TUPLES_INVALID)
 			{
 				break;
@@ -1388,7 +1388,6 @@ HasRecurringTuples(Node *node, RecurringTuplesType *recurType)
 			 */
 			return true;
 		}
-
 
 		return query_tree_walker((Query *) node, HasRecurringTuples,
 								 recurType, QTW_EXAMINE_RTES);
